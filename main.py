@@ -1,3 +1,5 @@
+import os
+import time
 from pathlib import Path
 from datetime import datetime
 import tempfile
@@ -11,6 +13,8 @@ from services.database import (
     list_articles,
     get_article,
     get_article_count,
+    delete_article,
+    clear_all_articles,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -25,15 +29,15 @@ def get_history_choices():
     """Return (visible label, database ID) choices for the history sidebar."""
     choices = []
     for item in list_articles(limit=50):
-        title = (item["title"] or item["topic"] or "Untitled Research").strip()
-        title = title.lstrip("# ").strip()
-
-        # Clean truncation so title fits cleanly on one line without wrapping
-        if len(title) > 28:
-            truncated = title[:27].rsplit(" ", 1)[0]
-            display_title = (truncated if truncated else title[:27]) + "…"
+        raw_title = (item["title"] or item["topic"] or "Untitled Research").strip()
+        raw_title = raw_title.lstrip("# ").strip()
+        # Clean up whitespace and keep a clean single line title
+        clean_title = " ".join(raw_title.split())
+        if len(clean_title) > 60:
+            truncated = clean_title[:59].rsplit(" ", 1)[0]
+            display_title = (truncated if truncated else clean_title[:59]) + "…"
         else:
-            display_title = title
+            display_title = clean_title
 
         try:
             dt = datetime.fromisoformat(item["created_at"])
@@ -47,16 +51,96 @@ def get_history_choices():
 
 def load_history(article_id):
     if not article_id:
-        return "Select an article from your history to read it.", "Choose an article from the sidebar."
+        return (
+            "### Your article will appear here\n\nStart a new research project or select an item from Recent History.",
+            "Choose an article from the sidebar or generate a new one.",
+            None,
+        )
     article = get_article(int(article_id))
     if not article:
-        return "This article could not be found.", "The selected history item is unavailable."
-    return article["content"], f"Loaded: {article['title']}"
+        return "This article could not be found.", "The selected history item is unavailable.", None
+
+    export_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", suffix=".md",
+            prefix="research_article_", delete=False
+        ) as handle:
+            handle.write(article["content"])
+            export_path = handle.name
+    except Exception:
+        export_path = None
+
+    return article["content"], f"Loaded: {article['title']}", export_path
+
+
+def delete_history_item(article_id_to_delete, current_selected_id):
+    if not article_id_to_delete:
+        choices = get_history_choices()
+        return (
+            gr.update(choices=choices),
+            gr.update(),
+            gr.update(),
+            get_saved_card_html(get_article_count()),
+            gr.update(),
+        )
+
+    try:
+        del_id = int(str(article_id_to_delete).strip())
+        delete_article(del_id)
+    except Exception as exc:
+        print(f"Error deleting article {article_id_to_delete}: {exc}")
+
+    choices = get_history_choices()
+    new_count = get_article_count()
+
+    # If the deleted article was currently selected or loaded, reset view
+    is_current = (
+        current_selected_id is not None
+        and str(article_id_to_delete).strip() == str(current_selected_id).strip()
+    )
+
+    if is_current:
+        new_selected = None
+        new_content = "### Your article will appear here\n\nStart a new research project or select an item from Recent History."
+        new_status = "Article deleted from history."
+        new_export = None
+    else:
+        new_selected = current_selected_id
+        new_content = gr.update()
+        new_status = "Article deleted from history."
+        new_export = gr.update()
+
+    return (
+        gr.update(choices=choices, value=new_selected),
+        new_content,
+        new_status,
+        get_saved_card_html(new_count),
+        new_export,
+    )
+
+
+def delete_current_article(current_selected_id):
+    if not current_selected_id:
+        return (
+            gr.update(),
+            gr.update(),
+            "No article currently selected to delete.",
+            get_saved_card_html(get_article_count()),
+            gr.update(),
+        )
+    return delete_history_item(current_selected_id, current_selected_id)
 
 
 def create_article(topic, year=None):
     if not topic or not topic.strip():
-        raise gr.Error("Enter a research topic first.")
+        yield (
+            "### Please enter a research topic\n\nType your topic above and click Generate article to begin.",
+            gr.update(),
+            "Enter a research topic first.",
+            None,
+        )
+        return
 
     current_year = str(year) if year else str(datetime.now().year)
 
@@ -89,6 +173,24 @@ def create_article(topic, year=None):
             handle.write(article_text)
             export_path = handle.name
 
+        # Stream research article generation with smooth real-time typewriter progression
+        words = article_text.split(" ")
+        total_words = len(words)
+        chunk_step = max(3, min(6, total_words // 65)) if total_words > 0 else 4
+
+        accumulated = []
+        for i in range(0, total_words, chunk_step):
+            accumulated.extend(words[i : i + chunk_step])
+            stream_chunk = " ".join(accumulated)
+            yield (
+                stream_chunk,
+                gr.update(),
+                "✍️ Synthesizing research text…",
+                None,
+            )
+            time.sleep(0.02)
+
+        # Final yield with full article, updated history choices, status, and download file
         yield (
             article_text,
             gr.update(choices=choices, value=str(article_id)),
@@ -106,18 +208,23 @@ def create_article(topic, year=None):
 
 def refresh_history():
     choices = get_history_choices()
-    selected = choices[0][1] if choices else None
-    if selected:
-        article = get_article(int(selected))
-        return (
-            gr.update(choices=choices, value=selected),
-            article["content"],
-            "History refreshed.",
-        )
     return (
-        gr.update(choices=[], value=None),
-        "No saved articles yet.",
-        "Your saved articles will appear here.",
+        gr.update(choices=choices, value=None),
+        "### Your article will appear here\n\nStart a new research project or select an item from Recent History.",
+        "History refreshed.",
+        None,
+    )
+
+
+def clear_all_history_action():
+    clear_all_articles()
+    choices = get_history_choices()
+    return (
+        gr.update(choices=choices, value=None),
+        "### Your article will appear here\n\nStart a new research project or select an item from Recent History.",
+        "All research history cleared.",
+        get_saved_card_html(0),
+        None,
     )
 
 
@@ -147,8 +254,8 @@ with open(JS_PATH, "r", encoding="utf-8") as file:
     js_content = file.read()
 
 initial_choices = get_history_choices()
-initial_selected = initial_choices[0][1] if initial_choices else None
-initial_article = get_article(int(initial_selected)) if initial_selected else None
+initial_selected = None
+initial_article = None
 
 with gr.Blocks(
     title="ResearchOS — AI Research Workspace",
@@ -180,13 +287,20 @@ with gr.Blocks(
 
             history_radio = gr.Radio(
                 choices=initial_choices,
-                value=initial_selected,
+                value=None,
                 label=None,
                 container=False,
                 elem_id="history-list",
                 info="",
             )
-            refresh_btn = gr.Button("↻   Refresh history", elem_id="refresh-history-btn")
+            with gr.Row(elem_id="history-actions-row"):
+                refresh_btn = gr.Button("↻   Refresh", elem_id="refresh-history-btn")
+                clear_all_btn = gr.Button("🗑   Clear all", elem_id="clear-all-history-btn")
+
+            # Hidden delete controls (hidden via CSS to preserve DOM presence)
+            with gr.Row(elem_id="hidden-history-controls"):
+                delete_target_id = gr.Textbox(elem_id="delete-target-id")
+                delete_action_btn = gr.Button(elem_id="delete-action-btn")
             gr.HTML("""
                 <div class="sidebar-bottom">
                     <div class="sidebar-divider"></div>
@@ -256,7 +370,7 @@ with gr.Blocks(
                             <span class="stage-tag">AI Writer</span>
                         </div>
                     """)
-                    generate_btn = gr.Button("Generate article  ↗", variant="primary", elem_id="generate-btn")
+                    generate_btn = gr.Button("Generate article  ↗", variant="primary", elem_id="generate-btn", interactive=False)
 
             with gr.Row(elem_id="metrics-row"):
                 with gr.Column(elem_classes=["metric-card"], min_width=0):
@@ -297,6 +411,7 @@ with gr.Blocks(
                         """)
                     with gr.Row(scale=0, elem_id="article-actions"):
                         copy_btn = gr.Button("📋  Copy article", elem_id="copy-btn")
+                        delete_article_btn = gr.Button("🗑  Delete article", elem_id="delete-article-btn")
                         export_file = gr.DownloadButton(
                             "↓  Download Markdown",
                             value=None,
@@ -306,6 +421,138 @@ with gr.Blocks(
                 article_status = gr.Markdown(
                     "Choose an article from the sidebar or generate a new one.",
                     elem_id="article-status",
+                )
+                research_loader = gr.HTML(
+                    """
+                    <div id="research-loader" class="research-loader" style="display: none;">
+                        <!-- Flowing Top Neon Progress Beam -->
+                        <div class="loader-beam-track">
+                            <div class="loader-beam-fill"></div>
+                        </div>
+
+                        <div class="loader-backdrop-glow"></div>
+
+                        <div class="loader-header">
+                            <div class="reactor-container">
+                                <div class="loader-reactor">
+                                    <div class="reactor-ring outer">
+                                        <span class="orbit-spark s1"></span>
+                                        <span class="orbit-spark s2"></span>
+                                    </div>
+                                    <div class="reactor-ring middle"></div>
+                                    <div class="reactor-ring inner"></div>
+                                    <div class="reactor-core">
+                                        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                                            <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+                                        </svg>
+                                    </div>
+                                </div>
+                                <!-- Audio-Visual AI Spectrum Equalizer -->
+                                <div class="ai-equalizer" title="Autonomous LLM Inference Stream">
+                                    <span class="eq-bar eq-1"></span>
+                                    <span class="eq-bar eq-2"></span>
+                                    <span class="eq-bar eq-3"></span>
+                                    <span class="eq-bar eq-4"></span>
+                                    <span class="eq-bar eq-5"></span>
+                                    <span class="eq-bar eq-6"></span>
+                                    <span class="eq-bar eq-7"></span>
+                                    <span class="eq-bar eq-8"></span>
+                                    <span class="eq-bar eq-9"></span>
+                                </div>
+                            </div>
+
+                            <div class="loader-titles">
+                                <div class="loader-badge">
+                                    <span class="loader-pulse-dot"></span>
+                                    <span class="loader-badge-text">AUTONOMOUS MULTI-AGENT INTELLIGENCE</span>
+                                </div>
+                                <h3 class="loader-heading">Synthesizing research article...</h3>
+                                <p class="loader-sub">Researcher & writer agents searching live sources, analyzing insights, and formatting publication.</p>
+                            </div>
+
+                            <div class="loader-timer-pill" id="loader-timer">
+                                <span class="timer-dot"></span>
+                                <span class="timer-label">ELAPSED</span>
+                                <span id="loader-timer-text">00:00</span>
+                            </div>
+                        </div>
+
+                        <!-- 4-Stage Agent Timeline -->
+                        <div class="loader-stages">
+                            <div class="loader-stage active" id="stage-1" data-stage="1">
+                                <div class="stage-radar"></div>
+                                <div class="stage-top">
+                                    <div class="stage-icon-wrap">
+                                        <span class="stage-num">1</span>
+                                        <span class="stage-check">✓</span>
+                                    </div>
+                                    <div class="stage-status-tag">Searching...</div>
+                                </div>
+                                <div class="stage-info">
+                                    <div class="stage-name">Live Web Search</div>
+                                    <div class="stage-desc">Scanning web for real-time sources & facts</div>
+                                </div>
+                            </div>
+
+                            <div class="loader-stage" id="stage-2" data-stage="2">
+                                <div class="stage-radar"></div>
+                                <div class="stage-top">
+                                    <div class="stage-icon-wrap">
+                                        <span class="stage-num">2</span>
+                                        <span class="stage-check">✓</span>
+                                    </div>
+                                    <div class="stage-status-tag">Pending</div>
+                                </div>
+                                <div class="stage-info">
+                                    <div class="stage-name">AI Researcher</div>
+                                    <div class="stage-desc">Extracting insights & key trends</div>
+                                </div>
+                            </div>
+
+                            <div class="loader-stage" id="stage-3" data-stage="3">
+                                <div class="stage-radar"></div>
+                                <div class="stage-top">
+                                    <div class="stage-icon-wrap">
+                                        <span class="stage-num">3</span>
+                                        <span class="stage-check">✓</span>
+                                    </div>
+                                    <div class="stage-status-tag">Pending</div>
+                                </div>
+                                <div class="stage-info">
+                                    <div class="stage-name">AI Writer</div>
+                                    <div class="stage-desc">Synthesizing comprehensive article</div>
+                                </div>
+                            </div>
+
+                            <div class="loader-stage" id="stage-4" data-stage="4">
+                                <div class="stage-radar"></div>
+                                <div class="stage-top">
+                                    <div class="stage-icon-wrap">
+                                        <span class="stage-num">4</span>
+                                        <span class="stage-check">✓</span>
+                                    </div>
+                                    <div class="stage-status-tag">Pending</div>
+                                </div>
+                                <div class="stage-info">
+                                    <div class="stage-name">Final Polish</div>
+                                    <div class="stage-desc">Formatting executive summary & markdown</div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Skeleton Shimmer Document Preview -->
+                        <div class="loader-skeleton">
+                            <div class="skeleton-header-line">
+                                <div class="skeleton-line s-title"></div>
+                                <div class="skeleton-pill"></div>
+                            </div>
+                            <div class="skeleton-line s-line-1"></div>
+                            <div class="skeleton-line s-line-2"></div>
+                            <div class="skeleton-line s-line-3"></div>
+                        </div>
+                    </div>
+                    """,
+                    elem_id="loader-html-box",
                 )
                 article_output = gr.Markdown(
                     value=initial_article["content"] if initial_article else
@@ -333,28 +580,80 @@ with gr.Blocks(
     history_radio.change(
         fn=load_history,
         inputs=history_radio,
-        outputs=[article_output, article_status],
+        outputs=[article_output, article_status, export_file],
     )
 
     refresh_btn.click(
         fn=refresh_history,
         inputs=None,
-        outputs=[history_radio, article_output, article_status],
+        outputs=[history_radio, article_output, article_status, export_file],
     ).then(
         fn=lambda: get_saved_card_html(get_article_count()),
         inputs=None,
         outputs=saved_count,
     )
 
-    new_research_btn.click(
-        fn=lambda: ("", "Ready for a new research project. Type your topic above."),
+    clear_all_btn.click(
+        fn=clear_all_history_action,
         inputs=None,
-        outputs=[topic_input, article_status],
+        outputs=[history_radio, article_output, article_status, saved_count, export_file],
     )
+
+    delete_action_btn.click(
+        fn=delete_history_item,
+        inputs=[delete_target_id, history_radio],
+        outputs=[history_radio, article_output, article_status, saved_count, export_file],
+    )
+
+    delete_article_btn.click(
+        fn=delete_current_article,
+        inputs=[history_radio],
+        outputs=[history_radio, article_output, article_status, saved_count, export_file],
+    )
+
+    topic_input.input(
+        fn=lambda t: gr.update(interactive=bool(t and t.strip())),
+        inputs=[topic_input],
+        outputs=[generate_btn],
+        queue=False,
+        show_progress="hidden",
+    )
+
+    new_research_btn.click(
+        fn=lambda: (
+            "",
+            gr.update(interactive=False),
+            gr.update(value=None),
+            "### Your article will appear here\n\nStart a new research project or select an item from Recent History.",
+            "Choose an article from the sidebar or generate a new one.",
+            None,
+        ),
+        inputs=None,
+        outputs=[topic_input, generate_btn, history_radio, article_output, article_status, export_file],
+    )
+
+
+def api_delete_article(article_id: int):
+    try:
+        success = delete_article(int(article_id))
+        return {"success": success, "count": get_article_count()}
+    except Exception as exc:
+        return {"success": False, "error": str(exc), "count": get_article_count()}
+
+
+def api_clear_all_articles():
+    try:
+        deleted_count = clear_all_articles()
+        return {"success": True, "count": 0, "deleted": deleted_count}
+    except Exception as exc:
+        return {"success": False, "error": str(exc), "count": get_article_count()}
+
 
 if __name__ == "__main__":
     demo.queue(default_concurrency_limit=1)
-    demo.launch(
+    app, local_url, _ = demo.launch(
+        server_name="0.0.0.0",
+        server_port=int(os.environ.get("PORT", 7860)),
         theme=gr.themes.Base(
             primary_hue="violet",
             secondary_hue="cyan",
@@ -362,4 +661,9 @@ if __name__ == "__main__":
         ),
         css=css_content,
         js=js_content,
+        prevent_thread_lock=True,
     )
+    # Attach direct REST endpoints for instant, reliable history deletion
+    app.add_api_route("/api/articles/{article_id}/delete", api_delete_article, methods=["POST"])
+    app.add_api_route("/api/articles/clear-all", api_clear_all_articles, methods=["POST"])
+    demo.block_thread()

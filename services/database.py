@@ -68,3 +68,18 @@ def get_article_count() -> int:
     with get_connection() as connection:
         row = connection.execute("SELECT COUNT(*) AS total FROM articles").fetchone()
     return int(row["total"])
+
+
+def delete_article(article_id: int) -> bool:
+    with get_connection() as connection:
+        cursor = connection.execute("DELETE FROM articles WHERE id = ?", (article_id,))
+        connection.commit()
+        return cursor.rowcount > 0
+
+
+def clear_all_articles() -> int:
+    with get_connection() as connection:
+        cursor = connection.execute("DELETE FROM articles")
+        connection.commit()
+        return cursor.rowcount
+
